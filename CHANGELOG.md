@@ -1,5 +1,29 @@
 # Changelog
 
+## [0.1.9]
+
+### Fixed
+- **Optics16 channel order** (issue #24): the device transmits *wavelength-major*, not location-major. Every channel name previously pointed at a different photodiode, so any name-based selection read the wrong sensor and pulse oximetry (which needs a specific RED/IR pair) could not be done correctly. `OPTICS16_CHANNELS` is now `RED×4, AMB×4, NIR×4, IR×4` in `LI, RI, LO, RO` order. Confirmed on firmware 3.1.23. Optics8 and Optics4 are separate packet types and now have their own explicit layouts (`OPTICS8_CHANNELS`, `OPTICS4_CHANNELS`) instead of being sliced out of the 16-channel list — the 4-channel selection was previously taken from indices `(4,5,6,7)`, which under the corrected order is the ambient group.
+- **One malformed subpacket no longer discards the whole decode**: a mixed-width subpacket raised `ValueError: could not broadcast input array from shape (4,4) into shape (4,8)` out of `decode_rawdata()`, losing the entire file. On a 25-minute capture that threw away 386,092 recoverable EEG rows over two bad subpackets. Streams now adopt the layout carrying the most samples, NaN-pad narrower EEG subpackets (channels 0–3 are TP9/AF7/AF8/TP10 in both layouts), drop incompatible ones, and report both counts via a `RuntimeWarning` and `decode_rawdata(..., return_info=True)`.
+- **A declared packet length below the header size** crashed `_parse_packets` with `IndexError` and would otherwise have looped forever without advancing. Trailing padding bytes look exactly like this.
+- **Battery percentages outside 0–100 are now `NaN`** instead of a number known to be wrong (issue #28). Values of 150.0, 228.0 and 229.0 have been observed in the wild: the TAG scan that locates battery subpackets can desynchronise, and the resulting "percentage" is an arbitrary `uint16 / 256`.
+- **`import OpenMuse` no longer requires `mne-lsl` or `vispy`**, which blocked the whole library on platforms without those wheels (e.g. 32-bit armhf Raspberry Pi).
+
+### Added
+- **Authoritative battery via the control channel**: the device's reply to `s` (`{"bp": 89.11, "ps": 4161, ...}`) was already requested and then discarded. `ControlChannel` now reassembles it — the replies arrive as length-prefixed 20-byte fragments, are NUL-padded and separated by a checksum byte, so they must be found by brace matching rather than split on `}{`. `record(battery_interval=300)` re-issues `s` on a timer and writes each reply into the raw file, so a whole-night **drain curve** falls out of the normal decode with `source == "status"` and a `battery_millivolts` column. `get_status(address)` reads it standalone.
+- **`decode_rawdata(..., timebase="absolute")`**: a timebase anchored to the ISO-8601 arrival stamp on every raw line, split at real dropouts and least-squares fitted per segment. Monotonic, comparable across chunks and files, and it *measures* the sampling rate (255.62 Hz EEG, 64.15 Hz optics, 52.27 Hz accgyro on a reference capture) instead of assuming the nominal one, which is ~0.14% fast — about 40 s of drift over an 8 h night.
+- **`decode_rawdata(..., return_info=True)`** reports measured rate, segment count, samples, and skipped/padded subpackets per stream.
+- **Stall detection in `record()`**: a dropped BLE link used to leave the coroutine awaiting notifications that never arrive — writing nothing, raising nothing, and returning success when the duration elapsed, so a supervisor never restarted it. `stall_timeout` (default 120 s) now raises `RecordingStalled`. `record()` returns `RecordingResult` objects reporting notification and byte counts.
+- **`PRESETS`, `describe_preset()`, `preset_for_sensors()` and `OpenMuse presets`**: the preset string is the only control over which sensors the headset actually runs, and it had no representation in code. The table is derived from the committed captures and re-derived by `tests/test_presets.py`. `record(sensors=["EEG", "ACCGYRO"])` resolves to a preset, so callers can express intent instead of magic strings.
+- Optional dependency extras: `OpenMuse[stream]`, `OpenMuse[view]`, `OpenMuse[all]`.
+
+### Changed
+- **`L1` (low-latency mode) is now opt-in.** It was sent unconditionally, asking the headset for a short BLE connection interval; the radio is one of the largest consumers on the device and the interval sets its duty cycle. Recording does not need it — the full `p1041` payload is only ~6.7 KB/s, comfortable at a 50 ms interval — so `record()` defaults to `low_latency=False`, while `stream()` requests it explicitly.
+- `requires-python` relaxed from `>=3.12` to `>=3.10`; the `>=3.12` floor came from `mne-lsl`, which only `stream`/`view` need. CI now also tests 3.10 and 3.11.
+- `matplotlib` dropped from the dependency list (unused).
+- Control-characteristic notifications are recognised by UUID and no longer parsed as sensor packets.
+- README: `p1034` corrected to EEG**4** (its packets carry TAG `0x11`, not `0x12`).
+
 
 ## [0.1.8]
 

@@ -271,25 +271,26 @@ class TestDecodeRawdata(unittest.TestCase):
 
         # Should have data
         if len(optics_df) > 0:
-            # Should have correct columns for Optics16
+            # Optics16 is transmitted wavelength-major, not location-major
+            # (issue #24) -- see tests/test_optics_mapping.py for the evidence.
             expected_columns = [
                 "time",
-                "OPTICS_LO_NIR",
-                "OPTICS_RO_NIR",
-                "OPTICS_LO_IR",
-                "OPTICS_RO_IR",
-                "OPTICS_LI_NIR",
-                "OPTICS_RI_NIR",
-                "OPTICS_LI_IR",
-                "OPTICS_RI_IR",
-                "OPTICS_LO_RED",
-                "OPTICS_RO_RED",
-                "OPTICS_LO_AMB",
-                "OPTICS_RO_AMB",
                 "OPTICS_LI_RED",
                 "OPTICS_RI_RED",
+                "OPTICS_LO_RED",
+                "OPTICS_RO_RED",
                 "OPTICS_LI_AMB",
                 "OPTICS_RI_AMB",
+                "OPTICS_LO_AMB",
+                "OPTICS_RO_AMB",
+                "OPTICS_LI_NIR",
+                "OPTICS_RI_NIR",
+                "OPTICS_LO_NIR",
+                "OPTICS_RO_NIR",
+                "OPTICS_LI_IR",
+                "OPTICS_RI_IR",
+                "OPTICS_LO_IR",
+                "OPTICS_RO_IR",
             ]
             self.assertEqual(list(optics_df.columns), expected_columns)
 

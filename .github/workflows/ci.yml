@@ -12,7 +12,9 @@ jobs:
         strategy:
             matrix:
                 os: [ubuntu-latest, windows-latest, macos-latest]
-                python-version: ["3.12", "3.14"]
+                # The core (record / decode / find) supports 3.10+; only the
+                # optional stream/view extras need a newer floor.
+                python-version: ["3.10", "3.11", "3.12", "3.14"]
 
         steps:
             - uses: actions/checkout@v4
@@ -27,6 +29,11 @@ jobs:
                   python -m pip install --upgrade pip
                   pip install -e .
                   pip install pytest pytest-cov flake8  # For testing, coverage, and linting
+
+            - name: Core imports without the optional extras
+              # `import OpenMuse` must not require mne-lsl / vispy: that is what
+              # blocks platforms with no wheels for them (e.g. armhf Raspberry Pi).
+              run: python -c "import OpenMuse; OpenMuse.record; OpenMuse.decode_rawdata"
 
             - name: Lint with flake8
               run: |

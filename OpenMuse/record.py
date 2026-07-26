@@ -1,14 +1,59 @@
 import asyncio
 import os
 import time
-from datetime import datetime
-from typing import Iterable, List, Optional, Union
+from typing import Iterable, List, Optional, Sequence, Union
 
 import bleak
 
 from .backends import _run
-from .muse import MuseS
+from .muse import MuseS, preset_for_sensors
 from .utils import get_utc_timestamp
+
+
+class RecordingStalled(RuntimeError):
+    """No notification arrived within ``stall_timeout`` seconds.
+
+    Raised so a supervisor can act.  A dropped BLE link does not stop
+    ``record()`` on its own: the coroutine simply keeps awaiting notifications
+    that will never arrive, writes nothing, and -- before this existed --
+    returned success when the requested duration finally elapsed.  With the
+    default 12 h duration that silently costs an entire night, and systemd or
+    any other supervisor sees a clean run and never restarts it.
+    """
+
+
+class RecordingResult:
+    """Outcome of one device's recording.
+
+    ``record()`` used to return ``None``, so a caller could not tell a
+    productive run from one that connected and received nothing.  Check
+    ``notifications`` / ``bytes_written`` to detect a zero-yield run.
+    """
+
+    __slots__ = ("address", "outfile", "notifications", "bytes_written", "duration", "stalled")
+
+    def __init__(
+        self,
+        address: str,
+        outfile: str,
+        notifications: int,
+        bytes_written: int,
+        duration: float,
+        stalled: bool,
+    ) -> None:
+        self.address = address
+        self.outfile = outfile
+        self.notifications = notifications
+        self.bytes_written = bytes_written
+        self.duration = duration
+        self.stalled = stalled
+
+    def __repr__(self) -> str:
+        return (
+            f"RecordingResult(address={self.address!r}, outfile={self.outfile!r}, "
+            f"notifications={self.notifications}, bytes_written={self.bytes_written}, "
+            f"duration={self.duration:.1f}, stalled={self.stalled})"
+        )
 
 
 async def _record_async(
@@ -18,11 +63,16 @@ async def _record_async(
     preset: str = "p1041",
     subscribe_chars: Optional[Iterable[str]] = None,
     verbose: bool = True,
-) -> None:
+    low_latency: bool = False,
+    stall_timeout: Optional[float] = 120.0,
+    battery_interval: Optional[float] = 300.0,
+) -> RecordingResult:
     if subscribe_chars is None:
         subscribe_chars = list(MuseS.DATA_CHARACTERISTICS)
 
     notified = 0
+    bytes_written = 0
+    last_notification = time.monotonic()
     stream_started = asyncio.Event()
 
     # Ensure output directory exists
@@ -36,23 +86,36 @@ async def _record_async(
     # Open output file in text mode and append
     f = open(outfile, "a", encoding="utf-8")
 
+    def _write(uuid: str, payload: bytes) -> None:
+        nonlocal bytes_written
+        line = f"{get_utc_timestamp()}\t{uuid}\t{payload.hex()}\n"
+        f.write(line)
+        bytes_written += len(line)
+
     # Raw recording only
     def _callback(uuid: str):
         def inner(_, data: bytearray):
-            nonlocal notified
+            nonlocal notified, last_notification
             notified += 1
-            # Log timestamp, char UUID, and hex payload
-            ts = get_utc_timestamp()
-            line = f"{ts}\t{uuid}\t{data.hex()}\n"
-            f.write(line)
+            last_notification = time.monotonic()
+            _write(uuid, bytes(data))
             # Raw recording only; no decoding or viewing
             if not stream_started.is_set():
                 stream_started.set()
 
         return inner
 
+    def _on_control_raw(payload: bytes) -> None:
+        # Persist status replies alongside the sensor data. decode_rawdata()
+        # reassembles them into authoritative BATTERY rows; parse_message()
+        # skips them, so older readers are unaffected.
+        _write(MuseS.CONTROL_UUID, payload)
+
     if verbose:
         print(f"Connecting to {address} ...")
+
+    stalled = False
+    start = time.monotonic()
 
     try:
         async with bleak.BleakClient(address, timeout=15.0) as client:
@@ -63,18 +126,56 @@ async def _record_async(
             data_callbacks = {uuid: _callback(uuid) for uuid in subscribe_chars}
 
             # Use shared connection routine
-            await MuseS.connect_and_initialize(client, preset, data_callbacks, verbose)
+            control = await MuseS.connect_and_initialize(
+                client,
+                preset,
+                data_callbacks,
+                verbose,
+                low_latency=low_latency,
+                on_control_raw=_on_control_raw,
+            )
 
-            # Streaming is now active (callbacks are registered and device is configured)
-            # Data will start flowing asynchronously
+            # Streaming is now active (callbacks are registered and device is
+            # configured); data starts flowing asynchronously.
+            last_notification = time.monotonic()
 
             if verbose:
                 print(f"Recording for {duration} seconds to {outfile} ...")
 
-            start = time.time()
+            start = time.monotonic()
+            next_battery = (
+                start + battery_interval
+                if battery_interval and battery_interval > 0
+                else None
+            )
             try:
-                while time.time() - start < duration:
+                while time.monotonic() - start < duration:
                     await asyncio.sleep(0.05)
+                    now = time.monotonic()
+
+                    # A dead link and a quiet one look identical from here
+                    # unless the gap since the last notification is tracked.
+                    if (
+                        stall_timeout
+                        and stall_timeout > 0
+                        and now - last_notification > stall_timeout
+                    ):
+                        stalled = True
+                        break
+
+                    # Periodic status query: battery over the whole recording
+                    # is the useful artefact, not a single reading at connect
+                    # time. Only this process can do it -- one BLE client owns
+                    # the headset, and that is this one.
+                    if next_battery is not None and now >= next_battery:
+                        next_battery = now + battery_interval
+                        try:
+                            reply = await MuseS.query_status(client, control)
+                            if verbose and reply and "bp" in reply:
+                                print(f"Battery: {reply['bp']}%")
+                        except Exception as exc:
+                            if verbose:
+                                print(f"Warning: status query failed: {exc}")
             except asyncio.CancelledError:
                 pass
             finally:
@@ -99,17 +200,41 @@ async def _record_async(
             f.close()
         except Exception:
             pass
+
+    elapsed = time.monotonic() - start
     if verbose:
-        print(f"Done. Wrote {notified} notifications to {outfile}.")
+        print(f"Done. Wrote {notified} notifications ({bytes_written} bytes) to {outfile}.")
+
+    if stalled:
+        raise RecordingStalled(
+            f"{address}: no BLE notification for {stall_timeout:.0f}s after "
+            f"{elapsed:.0f}s of a {duration:.0f}s recording "
+            f"({notified} notifications, {bytes_written} bytes written to {outfile}). "
+            f"The link is down; the process would otherwise have sat idle until "
+            f"the duration elapsed and then reported success."
+        )
+
+    return RecordingResult(
+        address=address,
+        outfile=outfile,
+        notifications=notified,
+        bytes_written=bytes_written,
+        duration=elapsed,
+        stalled=False,
+    )
 
 
 def record(
     address: Union[str, List[str]],
     duration: float = 30.0,
     outfile: str = "muse_record.txt",
-    preset: str = "p1041",
+    preset: Optional[str] = None,
     verbose: bool = True,
-) -> None:
+    sensors: Optional[Sequence[str]] = None,
+    low_latency: bool = False,
+    stall_timeout: Optional[float] = 120.0,
+    battery_interval: Optional[float] = 300.0,
+) -> List[RecordingResult]:
     """
     Connect to one or more Muse devices, stream notifications, and append raw packets to text file(s).
     Supports recording from multiple devices simultaneously (e.g., for hyperscanning studies).
@@ -121,8 +246,34 @@ def record(
                Can be a single address (str) or a list of addresses (List[str]) for multi-device recording.
     - duration: Recording duration in seconds.
     - outfile: Path to output text file. For multiple devices, device address will be appended to filename.
-    - preset: Preset string to send (e.g., "p1041" or "p21").
+    - preset: Preset string to send (e.g., "p1041" or "p21"). Defaults to
+      "p1041" (every sensor) unless ``sensors`` is given. See
+      ``OpenMuse.PRESETS`` for what each preset enables -- it is the only
+      control over which sensors the *headset* runs, and therefore the only
+      one that saves power at the source.
+    - sensors: Sensor types to enable, e.g. ``["EEG", "ACCGYRO"]``, resolved to
+      a preset via :func:`OpenMuse.preset_for_sensors`. Mutually exclusive with
+      ``preset``. Leaving OPTICS out turns off sixteen LEDs and drops ~30% of
+      the payload.
     - verbose: Print progress messages.
+    - low_latency: Send ``L1``, requesting a short BLE connection interval.
+      Off by default: recording does not need it (nothing cares whether a
+      sample arrives 15 ms or 200 ms late) and the radio duty cycle it forces
+      is a large part of the power budget. Turn it on only if you are
+      consuming the file live.
+    - stall_timeout: Seconds without any BLE notification after which the
+      recording is abandoned and :class:`RecordingStalled` is raised, so a
+      supervisor can restart it. ``None`` restores the old behaviour of waiting
+      out the full duration in silence. Default 120 s.
+    - battery_interval: Seconds between status queries. Each reply is written
+      to the raw file and decodes into an authoritative ``BATTERY`` row
+      (percent *and* pack millivolts), so a drain curve for the whole night
+      falls out of the normal decode. ``None`` disables it. Default 300 s.
+
+    Returns a list of :class:`RecordingResult`, one per device, reporting the
+    notification and byte counts so a caller can detect a zero-yield run.
+
+    Raises :class:`RecordingStalled` if the link dies (see ``stall_timeout``).
     """
     # Convert single address to list for uniform handling
     addresses = [address] if isinstance(address, str) else address
@@ -136,6 +287,15 @@ def record(
         raise ValueError("duration must be positive")
     if not isinstance(outfile, str) or not outfile:
         raise ValueError("outfile must be a non-empty path string")
+
+    if sensors is not None:
+        if preset is not None:
+            raise ValueError("pass either 'preset' or 'sensors', not both")
+        preset = preset_for_sensors(sensors)
+        if verbose:
+            print(f"Sensors {list(sensors)} -> preset {preset!r}")
+    elif preset is None:
+        preset = "p1041"
 
     chars = list(MuseS.DATA_CHARACTERISTICS)
 
@@ -168,10 +328,13 @@ def record(
                     preset=preset,
                     subscribe_chars=chars,
                     verbose=verbose,
+                    low_latency=low_latency,
+                    stall_timeout=stall_timeout,
+                    battery_interval=battery_interval,
                 )
             )
 
         # Run all recordings concurrently
-        await asyncio.gather(*tasks)
+        return await asyncio.gather(*tasks)
 
     return _run(run_multirecord())

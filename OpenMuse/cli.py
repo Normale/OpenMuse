@@ -53,22 +53,91 @@ def main(argv=None):
         help="Output text file path (for multi-device, address will be appended)",
     )
     p_rec.add_argument(
-        "--preset", default="p1041", help="Preset to send (by default, p1041)"
+        "--preset",
+        default=None,
+        help="Preset to send (default: p1041, every sensor). The preset is the "
+        "only control over which sensors the headset runs. Run "
+        "'OpenMuse presets' for the measured table.",
+    )
+    p_rec.add_argument(
+        "--sensors",
+        nargs="+",
+        default=None,
+        choices=["EEG", "ACCGYRO", "OPTICS", "BATTERY"],
+        help="Sensors to enable, resolved to a preset (mutually exclusive with "
+        "--preset). Omitting OPTICS turns off 16 LEDs and ~30%% of the payload.",
+    )
+    p_rec.add_argument(
+        "--low-latency",
+        action="store_true",
+        help="Send L1 (short BLE connection interval). Off by default: "
+        "recording does not need it and it costs battery.",
+    )
+    p_rec.add_argument(
+        "--stall-timeout",
+        type=float,
+        default=120.0,
+        help="Abort with a non-zero exit status if no BLE notification arrives "
+        "for this many seconds, so a supervisor can restart (default: 120; "
+        "0 disables)",
+    )
+    p_rec.add_argument(
+        "--battery-interval",
+        type=float,
+        default=300.0,
+        help="Seconds between device status queries; each is written to the raw "
+        "file and decodes into a BATTERY row (default: 300; 0 disables)",
     )
 
     def handle_record(ns):
         if ns.duration <= 0:
             parser.error("--duration must be positive")
-        record(
+        if ns.sensors and ns.preset:
+            parser.error("pass either --preset or --sensors, not both")
+        results = record(
             address=ns.address,
             duration=ns.duration,
             outfile=ns.outfile,
             preset=ns.preset,
+            sensors=ns.sensors,
             verbose=True,
+            low_latency=ns.low_latency,
+            stall_timeout=ns.stall_timeout or None,
+            battery_interval=ns.battery_interval or None,
         )
+        if all(r.notifications == 0 for r in results):
+            print("Error: recorded zero notifications.", file=sys.stderr)
+            return 1
         return 0
 
     p_rec.set_defaults(func=handle_record)
+
+    # presets subcommand
+    p_presets = subparsers.add_parser(
+        "presets", help="Show what each preset enables (measured from captures)"
+    )
+
+    def handle_presets(ns):
+        from .muse import PRESETS
+
+        print(f"{'preset':>8}  {'EEG':>4}  {'OPTICS':>6}  {'ACCGYRO':>7}  {'BATTERY':>7}")
+        for name, layout in PRESETS.items():
+            def cell(key):
+                value = layout.get(key)
+                return "--" if not value else str(value)
+
+            print(
+                f"{name:>8}  {cell('EEG'):>4}  {cell('OPTICS'):>6}  "
+                f"{cell('ACCGYRO'):>7}  {cell('BATTERY'):>7}"
+            )
+        print(
+            "\nNumbers are channel counts. OPTICS is ~30% of the payload and "
+            "drives 16 LEDs;\nleaving it off is the largest available battery "
+            "saving. p21 = EEG + motion only."
+        )
+        return 0
+
+    p_presets.set_defaults(func=handle_presets)
 
     # stream subcommand
     p_stream = subparsers.add_parser(
@@ -121,7 +190,9 @@ def main(argv=None):
     )
 
     def handle_stream(ns):
-        from .stream import stream
+        # Routed through the package so a missing optional extra produces the
+        # "pip install OpenMuse[stream]" hint rather than a bare ImportError.
+        from . import stream
 
         if ns.duration is not None and ns.duration <= 0:
             parser.error("--duration must be positive when provided")
@@ -163,7 +234,7 @@ def main(argv=None):
     )
 
     def handle_view(ns):
-        from .view import view
+        from . import view
 
         if ns.window <= 0:
             parser.error("--window must be positive")

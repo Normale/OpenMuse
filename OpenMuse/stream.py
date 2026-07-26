@@ -432,8 +432,10 @@ async def _stream_async(
 
         start_time = time.monotonic()
         data_callbacks = {uuid: _on_data for uuid in MuseS.DATA_CHARACTERISTICS}
+        # Real-time streaming is the case that genuinely wants L1's short BLE
+        # connection interval, so ask for it here (record() does not).
         await MuseS.connect_and_initialize(
-            client, preset, data_callbacks, verbose=verbose
+            client, preset, data_callbacks, verbose=verbose, low_latency=True
         )
 
         if verbose:
