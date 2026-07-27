@@ -114,20 +114,55 @@ class RecordTestCase(unittest.TestCase):
 
 
 class TestLowLatencyIsOptIn(RecordTestCase):
-    def test_l1_not_sent_by_default(self):
+    """Recording stands low latency down with L0, as the vendor app does.
+
+    Captured from the manufacturer's Android app on firmware 3.1.23, the sleep
+    session writes ``L1, dc001, ... L0`` -- low latency to get the stream up,
+    then explicitly off. Merely declining to send ``L1`` is not the same: the
+    headset retains whatever mode it was last put in, so a recorder that only
+    omits the command can silently inherit low latency from an earlier session.
+    """
+
+    def test_low_latency_is_stood_down_by_default(self):
         self._record(stall_timeout=None, battery_interval=None)
         commands = FakeClient.instances[0].commands
-        self.assertNotIn(
-            "L1",
-            commands,
-            "recording must not request low-latency mode: it costs battery for "
-            "throughput nobody asked for",
-        )
         self.assertIn("dc001", commands, "streaming should still be started")
+        self.assertIn("L0", commands, "recording must explicitly disable low latency")
+        # ...and after the stream is up, not before it.
+        self.assertGreater(
+            commands.index("L0"),
+            commands.index("dc001"),
+            "L0 must follow dc001, so the stream establishes under low latency",
+        )
 
-    def test_l1_sent_when_requested(self):
+    def test_l1_precedes_dc001(self):
+        self._record(stall_timeout=None, battery_interval=None)
+        commands = FakeClient.instances[0].commands
+        self.assertIn("L1", commands)
+        self.assertLess(
+            commands.index("L1"),
+            commands.index("dc001"),
+            "the vendor app enables low latency before starting the stream",
+        )
+
+    def test_l1_kept_when_requested(self):
         self._record(low_latency=True, stall_timeout=None, battery_interval=None)
-        self.assertIn("L1", FakeClient.instances[0].commands)
+        commands = FakeClient.instances[0].commands
+        self.assertIn("L1", commands)
+        self.assertNotIn(
+            "L0", commands, "real-time streaming must keep low latency on"
+        )
+
+    def test_version_command_default_is_v6(self):
+        self._record(stall_timeout=None, battery_interval=None)
+        commands = FakeClient.instances[0].commands
+        self.assertIn("v6", commands)
+        self.assertNotIn(
+            "v7",
+            commands,
+            "v7 elicits pv:7 rather than pv:4 and is not yet validated against "
+            "this decoder, so it must not become the default silently",
+        )
 
 
 class TestStallDetection(RecordTestCase):

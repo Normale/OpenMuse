@@ -263,6 +263,15 @@ OpenMuse.preset_for_sensors(["EEG", "ACCGYRO"])            # 'p21'
 OpenMuse.describe_preset("p1041")                          # {'EEG': 8, 'OPTICS': 16, ...}
 ```
 
+> [!TIP]
+> **What the manufacturer's own app uses: `p1035`.** Captured from an Android
+> HCI snoop log during a sleep session (firmware 3.1.23), the vendor app runs a
+> brief `p21` fit check, then halts and settles on **`p1035`** — EEG4 +
+> Optics4 + ACC/GYRO — for the session itself. Four optics channels instead of
+> sixteen keeps PPG available at a fraction of the LED cost. It also sends
+> `L1` *before* `dc001` and then explicitly stands low latency down with `L0`
+> once streaming is established, which is what `record()` now does.
+
 #### Presets and battery life
 
 The preset is the **only** control over which sensors the headset actually runs, so it is the only setting that saves power at the source — `stream --sensors` filters after reception and saves nothing.

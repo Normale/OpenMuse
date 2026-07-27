@@ -338,9 +338,28 @@ def _scan_json_objects(text: str) -> Tuple[List[str], int]:
 
 
 def _strip_length_prefix(data: bytes) -> bytes:
-    """Drop the leading length byte of a control notification, when present."""
-    if data and data[0] == len(data) - 1:
-        return data[1:]
+    """Return the payload of a control notification, using its length byte.
+
+    Notifications are ``[len][payload...]`` padded out to the characteristic's
+    20-byte MTU, so the declared length must be used to *slice*, not merely to
+    recognise a prefix. Measured on firmware 3.1.23, the last fragment of a
+    reply looks like::
+
+        b'\\x0c0,0],"rc":0}\\x00\\x00\\x00\\x00\\x00\\x00:'
+           ^^^^ declared 12          ^^^ NUL padding    ^ checksum
+
+    Testing ``data[0] == len(data) - 1`` recognises only the *full* fragments
+    and leaves the length byte in place on this one, where it lands inside
+    ``"ch":[...]`` and makes the reassembled JSON invalid - so every reply that
+    ends on a short fragment, which is every reply carrying a battery reading,
+    was silently dropped. Slicing by the declared length also removes the
+    padding and checksum byte, so the brace matcher never sees them.
+    """
+    if not data:
+        return data
+    declared = data[0]
+    if 0 < declared <= len(data) - 1:
+        return data[1 : 1 + declared]
     return data
 
 

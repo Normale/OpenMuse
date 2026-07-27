@@ -218,36 +218,66 @@ class MuseS:
         preset: str,
         verbose: bool = False,
         low_latency: bool = False,
+        version_command: str = "v6",
+        low_latency_settle: float = 2.0,
     ) -> None:
         """
         Initialize Muse device with standard handshake and preset configuration.
 
+        The order here follows the **manufacturer's own application**, captured
+        from an Android HCI snoop log during a sleep session on firmware
+        3.1.23.  Writes to the control characteristic, in order::
+
+            v7, s, h, p21, s, L1, dc001,      # brief fit/signal check
+            h, p1035, s, L1, dc001,           # the actual session
+            L0,                               # ~4.8 s after streaming began
+            L1, h                             # session torn down
+
+        Two things in that are worth copying:
+
+        1. ``L1`` is sent *before* ``dc001`` (this package sent it after), and
+        2. low latency is not simply left unsent -- it is **explicitly stood
+           down with ``L0``** once the stream is up.  Omitting ``L1`` is not
+           equivalent: the headset keeps whatever mode it was last put in, so a
+           recorder that merely declines to ask for low latency can inherit it
+           from a previous session and never know.
+
         Performs:
-        1. Version query (v6)
+        1. Version query (``version_command``)
         2. Status query (s)
         3. Halt/reset (h)
         4. Apply preset
-        5. Start streaming (dc001)
-        6. Optionally enable low-latency mode (L1)
+        5. Enable low-latency (L1) so the stream comes up promptly
+        6. Start streaming (dc001)
+        7. Unless ``low_latency``, stand low latency back down (L0)
 
         Parameters
         ----------
         low_latency : bool
-            Send ``L1``, which asks the headset for a short BLE connection
-            interval.  The radio then wakes far more often than the data rate
-            requires, which is a large share of the device's power budget.
+            Keep low-latency mode on for the whole session.  ``L1`` asks the
+            headset for a short BLE connection interval, so the radio wakes far
+            more often than the data rate requires, and the radio is a large
+            share of the device's power budget.
 
             Real-time use (``stream``) wants this.  **Recording does not** --
             nothing cares whether a sample arrives 15 ms or 200 ms after
-            acquisition, only that it arrives -- so it defaults to ``False``
-            and ``record()`` leaves it off.  The full payload of preset
-            ``p1041`` (EEG 8ch @256 Hz + OPTICS 16ch @64 Hz + ACCGYRO 6ch
-            @52 Hz) is only ~6.7 KB/s, which fits comfortably in a 50 ms
-            connection interval (~335 B/event).
+            acquisition, only that it arrives.  With ``False`` (the default for
+            ``record()``) the handshake still uses ``L1`` to get streaming
+            started, then sends ``L0``, which is what the vendor app does.
+        version_command : str
+            ``v6`` (this package's historical choice) or ``v7`` (what the
+            vendor app sends).  They elicit different ``pv`` values in the
+            status reply -- ``pv:4`` and ``pv:7`` respectively -- so ``v7`` may
+            select a different protocol revision and has **not** been validated
+            against this package's decoder.  Left at ``v6`` until it has been.
+        low_latency_settle : float
+            Seconds to wait after ``dc001`` before sending ``L0``.  The vendor
+            app waits ~4.8 s; the point is to let the stream establish under
+            low latency first.
         """
         # Version/status handshake (best-effort)
         try:
-            await MuseS.send_command(client, "v6", verbose)
+            await MuseS.send_command(client, version_command, verbose)
             await asyncio.sleep(0.2)
             await MuseS.send_command(client, "s", verbose)
             await asyncio.sleep(0.2)
@@ -280,19 +310,35 @@ class MuseS:
         except Exception:
             pass
 
-        # Start streaming (SEND TWICE for reliability), then optionally L1
+        # L1 before dc001, as the vendor app does: low latency while the stream
+        # is coming up, so the first packets are not waiting on a long
+        # connection interval.
+        try:
+            await MuseS.send_command(client, "L1", verbose)
+            await asyncio.sleep(0.1)
+        except Exception:
+            pass
+
+        # Start streaming (SEND TWICE for reliability)
         await MuseS.send_command(client, "dc001", verbose)
         await asyncio.sleep(0.05)
         await MuseS.send_command(client, "dc001", verbose)
         await asyncio.sleep(0.1)
-        if low_latency:
+
+        if not low_latency:
+            # Stand low latency back down once the stream is established.
+            # Explicitly, with L0 -- simply not sending L1 leaves the headset in
+            # whatever mode it was last put in, which can be inherited from a
+            # previous session.
+            await asyncio.sleep(max(0.0, low_latency_settle))
             try:
-                await MuseS.send_command(client, "L1", verbose)
-                await asyncio.sleep(0.3)
-            except Exception:
-                pass
-        elif verbose:
-            print("Low-latency mode (L1) not requested; keeping the radio duty cycle low.")
+                await MuseS.send_command(client, "L0", verbose)
+                await asyncio.sleep(0.2)
+                if verbose:
+                    print("Low-latency mode stood down (L0) to cut radio duty cycle.")
+            except Exception as exc:
+                if verbose:
+                    print(f"Warning: L0 failed: {exc}")
 
         # Final status query
         try:

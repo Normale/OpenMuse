@@ -22,6 +22,7 @@ import unittest
 from OpenMuse.decode import (
     ControlChannel,
     _scan_json_objects,
+    _strip_length_prefix,
     decode_rawdata,
     is_control_uuid,
 )
@@ -45,7 +46,12 @@ VERSION_REPLY = {"fw": "3.1.23", "hw": "01.1", "sp": "Athena_RevE", "rc": 0}
 
 
 def wire(*replies):
-    """Serialise replies the way the device does: NUL padding + a checksum byte."""
+    """Concatenated reply text as a naive reader would see it.
+
+    Used for the text-level brace-matching tests: NUL padding and a checksum
+    byte between objects, which is what you get if you ignore the per-
+    notification length prefix (as the original implementation did).
+    """
     out = b""
     for i, reply in enumerate(replies):
         out += json.dumps(reply, separators=(",", ":")).encode()
@@ -55,12 +61,36 @@ def wire(*replies):
 
 
 def fragments(payload, size=20):
-    """Split into length-prefixed notifications, as BLE delivers them."""
+    """Split into notifications exactly as the device emits them.
+
+    Each is ``[len][payload]`` padded out to the full ``size``-byte MTU with
+    NULs and a trailing checksum byte. Verbatim from firmware 3.1.23::
+
+        b'\\x13{"hn":"MuseS-1E2B",'                       full fragment
+        b'\\x0c0,0],"rc":0}\\x00\\x00\\x00\\x00\\x00\\x00:'   short final one
+
+    The padding on that final fragment is the whole point: a parser that only
+    recognises the length byte when the fragment happens to be full leaves it
+    in place here, corrupting the reassembled JSON. Every reply carrying a
+    battery reading ends on a short fragment, so every one of them was lost.
+    """
     body = size - 1
-    return [
-        bytes([len(payload[i : i + body])]) + payload[i : i + body]
-        for i in range(0, len(payload), body)
-    ]
+    out = []
+    for i in range(0, len(payload), body):
+        chunk = payload[i : i + body]
+        frag = bytes([len(chunk)]) + chunk
+        if len(frag) < size:
+            frag += b"\x00" * (size - len(frag) - 1) + b":"
+        out.append(frag)
+    return out
+
+
+def json_fragments(*replies):
+    """Notifications for a sequence of replies, no inter-reply padding."""
+    out = []
+    for reply in replies:
+        out.extend(fragments(json.dumps(reply, separators=(",", ":")).encode()))
+    return out
 
 
 def control_lines(payload, start="2026-01-01T00:00:00+00:00"):
@@ -100,6 +130,58 @@ class TestBraceMatching(unittest.TestCase):
         objects, _ = _scan_json_objects(text)
         self.assertEqual(len(objects), 1)
         self.assertEqual(json.loads(objects[0])["name"], "a}b{c")
+
+
+class TestPaddedFragments(unittest.TestCase):
+    """The final fragment of a reply is short and NUL-padded (issue #28).
+
+    Verbatim from firmware 3.1.23, the last notification of a status reply is
+
+        b'\\x0c0,0],"rc":0}\\x00\\x00\\x00\\x00\\x00\\x00:'
+
+    Twenty bytes on the wire, twelve of them payload. A parser that strips the
+    length byte only when it equals len(data)-1 does nothing here, and the
+    stray \\x0c lands inside "ch":[...], so json.loads rejects the whole reply.
+    Since every battery-bearing reply ends on a short fragment, that silently
+    dropped 100% of them while the ACK-only replies (which fit one fragment)
+    parsed fine - so it looked like the device was answering without a battery
+    field rather than like a parser bug.
+    """
+
+    def test_short_final_fragment_is_sliced_by_declared_length(self):
+        frag = b'\x0c0,0],"rc":0}\x00\x00\x00\x00\x00\x00:'
+        self.assertEqual(len(frag), 20)
+        self.assertEqual(_strip_length_prefix(frag), b'0,0],"rc":0}')
+
+    def test_full_fragment_still_works(self):
+        frag = b'\x13{"hn":"MuseS-1E2B",'
+        self.assertEqual(len(frag), 20)
+        self.assertEqual(_strip_length_prefix(frag), b'{"hn":"MuseS-1E2B",')
+
+    def test_single_fragment_ack_is_unpadded_correctly(self):
+        frag = b'\x08{"rc":0}\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00,'
+        self.assertEqual(_strip_length_prefix(frag), b'{"rc":0}')
+
+    def test_battery_reply_survives_realistic_fragmentation(self):
+        channel = ControlChannel()
+        replies = []
+        for frag in json_fragments(STATUS_REPLY):
+            self.assertEqual(len(frag), 20, "device pads every notification")
+            replies.extend(channel.feed(frag))
+        self.assertEqual(len(replies), 1, "the battery reply must not be dropped")
+        self.assertEqual(channel.battery_percent, 89.11)
+        self.assertEqual(channel.battery_millivolts, 4161)
+
+    def test_a_run_of_replies_all_parse(self):
+        channel = ControlChannel()
+        levels = [99.0, 92.98, 91.14, 88.0]
+        seen = []
+        for level in levels:
+            reply = dict(STATUS_REPLY)
+            reply["bp"] = level
+            for frag in json_fragments(reply):
+                seen.extend(channel.feed(frag))
+        self.assertEqual([r["bp"] for r in seen], levels)
 
 
 class TestControlChannel(unittest.TestCase):

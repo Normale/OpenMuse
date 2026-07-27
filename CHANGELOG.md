@@ -18,7 +18,8 @@
 - Optional dependency extras: `OpenMuse[stream]`, `OpenMuse[view]`, `OpenMuse[all]`.
 
 ### Changed
-- **`L1` (low-latency mode) is now opt-in.** It was sent unconditionally, asking the headset for a short BLE connection interval; the radio is one of the largest consumers on the device and the interval sets its duty cycle. Recording does not need it — the full `p1041` payload is only ~6.7 KB/s, comfortable at a 50 ms interval — so `record()` defaults to `low_latency=False`, while `stream()` requests it explicitly.
+- **Low-latency mode is now explicitly stood down rather than merely not requested.** The handshake order now follows the manufacturer's own application, captured from an Android HCI snoop log during a sleep session on firmware 3.1.23: `v7, s, h, p21, s, L1, dc001, h, p1035, s, L1, dc001, L0`. Two corrections fall out of that. `L1` belongs *before* `dc001`, so the stream comes up without waiting on a long connection interval. And there is an explicit **`L0`** stand-down, which the app sends ~4.8 s after streaming begins — omitting `L1` is **not** equivalent, because the headset retains whatever mode it was last put in and can inherit low latency from a previous session. `record()` therefore uses `L1` to start the stream and then sends `L0`; `stream()` keeps `L1`. New `version_command` and `low_latency_settle` arguments on `initialize_device()`.
+- Documented that the vendor app's session preset is **`p1035`** (EEG4 + Optics4 + ACCGYRO), not `p1041` — four optics channels rather than sixteen, which keeps PPG affordable.
 - `requires-python` relaxed from `>=3.12` to `>=3.10`; the `>=3.12` floor came from `mne-lsl`, which only `stream`/`view` need. CI now also tests 3.10 and 3.11.
 - `matplotlib` dropped from the dependency list (unused).
 - Control-characteristic notifications are recognised by UUID and no longer parsed as sensor packets.
