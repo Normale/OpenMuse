@@ -8,6 +8,17 @@ from .backends import BleakBackend, _run
 from .decode import ControlChannel
 
 
+class HandshakeFailed(RuntimeError):
+    """The device connected but did not complete configuration.
+
+    Raised rather than warned about, because the alternative is streaming a
+    configuration nobody asked for. Observed 2026-08-05: after a dropout the
+    headset accepted ~2000 reconnects, ignored ``p1035`` each time, and sent
+    ACC/OPTICS/BATTERY with no EEG for eight hours - and every layer above
+    reported a healthy recording, because nothing ever checked.
+    """
+
+
 # ===================================
 # Find MAC addresses of Muse devices
 # ===================================
@@ -220,6 +231,8 @@ class MuseS:
         low_latency: bool = False,
         version_command: str = "v6",
         low_latency_settle: float = 2.0,
+        control: Optional["ControlChannel"] = None,
+        status_timeout: float = 3.0,
     ) -> None:
         """
         Initialize Muse device with standard handshake and preset configuration.
@@ -299,16 +312,54 @@ class MuseS:
         try:
             await MuseS.send_command(client, preset, verbose)
         except Exception as exc:
-            if verbose:
-                print(f"Warning: preset {preset!r} failed: {exc}")
+            raise HandshakeFailed(f"preset {preset!r} write failed: {exc}") from exc
         await asyncio.sleep(0.2)
 
-        # Query status again after preset change
-        try:
-            await MuseS.send_command(client, "s", verbose)
-            await asyncio.sleep(0.2)
-        except Exception:
-            pass
+        # Status query after the preset - and this time the reply is READ.
+        #
+        # It used to be sent into a bare `except: pass`, so the one message that
+        # says anything about the device's state was thrown away. Observed
+        # 2026-08-05: after a dropout the headset accepted every reconnect,
+        # ignored p1035, and streamed ACC/OPTICS/BATTERY with no EEG for eight
+        # hours while the recorder logged "preset=p1035" on each attempt.
+        #
+        # Note the limit: the reply carries {hn, sn, ma, hs, id, bp, ps, ln, ch,
+        # rc} on firmware 3.1.23 and does NOT report the active preset (`ch` is
+        # always [0,0], meaning unknown - see PROTOCOL_UNKNOWNS.md section 8).
+        # So this catches "the device stopped answering" and "the device
+        # reported an error", not "the preset failed to apply". Proving the
+        # preset took needs the sensor stream itself.
+        if control is not None:
+            # Two attempts: a single 's' is occasionally answered with silence
+            # even on a healthy device, and turning that into a restart would
+            # trade one failure mode for a worse one.
+            reply = await MuseS.query_status(client, control, timeout=status_timeout)
+            if reply is None:
+                if verbose:
+                    print("No status reply; retrying once ...")
+                reply = await MuseS.query_status(
+                    client, control, timeout=status_timeout
+                )
+            if reply is None:
+                raise HandshakeFailed(
+                    f"no status reply to two 's' queries within "
+                    f"{status_timeout:.0f}s each after preset {preset!r}; "
+                    f"the device is connected but not answering"
+                )
+            if verbose:
+                print(f"Status after preset {preset!r}: {json.dumps(reply)}")
+            rc = reply.get("rc")
+            if rc not in (0, None):
+                raise HandshakeFailed(
+                    f"device returned rc={rc} after preset {preset!r}: "
+                    f"{json.dumps(reply)}"
+                )
+        else:
+            try:
+                await MuseS.send_command(client, "s", verbose)
+                await asyncio.sleep(0.2)
+            except Exception:
+                pass
 
         # L1 before dc001, as the vendor app does: low latency while the stream
         # is coming up, so the first packets are not waiting on a long
@@ -424,7 +475,7 @@ class MuseS:
 
         # Initialize device (sends commands and triggers control responses)
         await MuseS.initialize_device(
-            client, preset, verbose, low_latency=low_latency
+            client, preset, verbose, low_latency=low_latency, control=control
         )
 
         # Wait for device info to be logged (up to 2 seconds)

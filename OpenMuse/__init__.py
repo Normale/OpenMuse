@@ -14,7 +14,8 @@ but ``mne-lsl`` cannot be installed.
 """
 
 from .decode import ControlChannel, decode_rawdata, parse_message
-from .muse import describe_preset, find_muse, get_status, MuseS, PRESETS, preset_for_sensors
+from .muse import (describe_preset, find_muse, get_status, HandshakeFailed, MuseS,
+                   PRESETS, preset_for_sensors)
 from .record import record, RecordingResult, RecordingStalled
 
 __version__ = "0.1.9"
@@ -31,6 +32,7 @@ __all__ = [
     "preset_for_sensors",
     "record",
     "RecordingResult",
+    "HandshakeFailed",
     "RecordingStalled",
     "stream",
     "view",
