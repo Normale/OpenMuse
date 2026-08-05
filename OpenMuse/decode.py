@@ -428,6 +428,33 @@ class ControlChannel:
         return str(value) if value is not None else None
 
 
+def sensor_types_in(payload: bytes) -> set:
+    """Which sensor types a raw notification carries, as cheaply as possible.
+
+    Reads one byte per packet - the ``pkt_id`` at offset 9 - and walks the same
+    length-prefixed framing as :func:`_parse_packets`, so it cannot drift from
+    it. No sample decoding, no allocation per packet.
+
+    This exists for the recorder's stream watchdog. A Muse multiplexes every
+    sensor onto one characteristic, so "notifications are arriving" does not
+    mean "the sensors we asked for are arriving": on 2026-08-05 the data
+    characteristic delivered 18,155 notifications in the first 20,000 lines of
+    a capture that contained no EEG at all.
+    """
+    seen = set()
+    offset = 0
+    n = len(payload)
+    while offset + PACKET_HEADER_SIZE <= n:
+        pkt_len = payload[offset]
+        if pkt_len < PACKET_HEADER_SIZE or offset + pkt_len > n:
+            break
+        config = SENSORS.get(payload[offset + 9])
+        if config:
+            seen.add(config["type"])
+        offset += pkt_len
+    return seen
+
+
 def parse_message(message: str) -> Dict[str, List[Dict]]:
     """
     Parse a BLE message into structured data.

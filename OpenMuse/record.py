@@ -6,7 +6,9 @@ from typing import Iterable, List, Optional, Sequence, Union
 import bleak
 
 from .backends import _run
-from .muse import MuseS, preset_for_sensors
+from .decode import sensor_types_in
+from .muse import (describe_preset, HandshakeFailed, MuseS,
+                   preset_for_sensors)
 from .utils import get_utc_timestamp
 
 
@@ -65,6 +67,7 @@ async def _record_async(
     verbose: bool = True,
     low_latency: bool = False,
     stall_timeout: Optional[float] = 120.0,
+    sensor_timeout: Optional[float] = 60.0,
     battery_interval: Optional[float] = 300.0,
 ) -> RecordingResult:
     if subscribe_chars is None:
@@ -74,6 +77,22 @@ async def _record_async(
     bytes_written = 0
     last_notification = time.monotonic()
     stream_started = asyncio.Event()
+
+    # Stream watchdog. A Muse multiplexes every sensor onto one characteristic,
+    # so "notifications are arriving" says nothing about *which* sensors are.
+    # Observed 2026-08-05: after a dropout the headset streamed ACC/OPTICS at
+    # full rate with no EEG for eight hours, and the recorder called that a
+    # healthy session because bytes were flowing.
+    #
+    # BATTERY is excluded: it is answered on the control channel every
+    # battery_interval (default 300 s), so it cannot be expected inside the
+    # grace window.
+    layout = describe_preset(preset) or {}
+    sensors_required = {
+        name for name, count in layout.items() if count and name != "BATTERY"
+    }
+    sensors_seen: set = set()
+    sensors_pending = bool(sensors_required)
 
     # Ensure output directory exists
     try:
@@ -95,11 +114,20 @@ async def _record_async(
     # Raw recording only
     def _callback(uuid: str):
         def inner(_, data: bytearray):
-            nonlocal notified, last_notification
+            nonlocal notified, last_notification, sensors_pending
             notified += 1
             last_notification = time.monotonic()
-            _write(uuid, bytes(data))
-            # Raw recording only; no decoding or viewing
+            payload = bytes(data)
+            _write(uuid, payload)
+            # Which sensors are actually arriving. Only while something is
+            # still missing - once every expected stream has been seen this
+            # costs nothing for the rest of the night.
+            if sensors_pending:
+                try:
+                    sensors_seen.update(sensor_types_in(payload))
+                    sensors_pending = bool(sensors_required - sensors_seen)
+                except Exception:
+                    sensors_pending = False
             if not stream_started.is_set():
                 stream_started.set()
 
@@ -162,6 +190,27 @@ async def _record_async(
                     ):
                         stalled = True
                         break
+
+                    # Stream watchdog: the requested sensors must actually turn
+                    # up, not merely *some* bytes. Checked once, at the end of
+                    # the grace window; after that sensors_pending is False and
+                    # this costs a comparison per loop.
+                    if (
+                        sensors_pending
+                        and sensor_timeout
+                        and sensor_timeout > 0
+                        and now - start > sensor_timeout
+                    ):
+                        missing = sorted(sensors_required - sensors_seen)
+                        raise HandshakeFailed(
+                            f"{address}: preset {preset!r} asked for "
+                            f"{sorted(sensors_required)} but {missing} never "
+                            f"arrived in {sensor_timeout:.0f}s "
+                            f"({notified} notifications, "
+                            f"{sorted(sensors_seen) or 'nothing'} seen). The "
+                            f"headset is streaming a configuration it was not "
+                            f"asked for; it usually needs a power cycle."
+                        )
 
                     # Periodic status query: battery over the whole recording
                     # is the useful artefact, not a single reading at connect
@@ -233,6 +282,7 @@ def record(
     sensors: Optional[Sequence[str]] = None,
     low_latency: bool = False,
     stall_timeout: Optional[float] = 120.0,
+    sensor_timeout: Optional[float] = 60.0,
     battery_interval: Optional[float] = 300.0,
 ) -> List[RecordingResult]:
     """
@@ -330,6 +380,7 @@ def record(
                     verbose=verbose,
                     low_latency=low_latency,
                     stall_timeout=stall_timeout,
+                    sensor_timeout=sensor_timeout,
                     battery_interval=battery_interval,
                 )
             )
