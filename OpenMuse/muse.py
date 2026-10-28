@@ -521,11 +521,41 @@ class MuseS:
 
     @staticmethod
     async def stop_streaming(client, verbose: bool = False) -> None:
-        """Send halt command to stop streaming."""
-        try:
-            await MuseS.send_command(client, "h", verbose)
-        except Exception:
-            pass
+        """Tear the session down the way the vendor app does: ``L1`` then ``h``.
+
+        The manufacturer's teardown, from the same HCI snoop log on firmware
+        3.1.23 that :meth:`initialize_device` follows, is ``L1, h`` -- low
+        latency is put back *on* before the halt.  This package sent a bare
+        ``h``, and only ever on the paths that unwind normally.
+
+        Why the ``L1`` is there: ``L0`` leaves the connection interval long, so
+        a single write can wait a long time for its next connection event.  The
+        halt is the one command that must actually land, and it is being sent
+        at the moment the link is least healthy.  ``L1`` shortens the interval
+        first so the halt has somewhere to go.
+
+        Why the halt matters at all: the headset latches its streaming
+        configuration.  A session that ends without a halt it can service can
+        leave it streaming a configuration nobody asked for on the next
+        connect -- ACC/OPTICS at full rate with no EEG, which survives
+        reconnects and, so far, has cleared only on a power cycle.  Observed
+        2026-08-05, -06, -08 and -10; the last cost seven hours of a night and
+        343 restarts.  That is a hypothesis about the cause, not a proven one.
+
+        Best-effort throughout.  This runs on the way out, usually on a link
+        that is already dying, and a failure here must never mask the error
+        that brought us here.
+        """
+        for token in ("L1", "h"):
+            try:
+                await MuseS.send_command(client, token, verbose)
+            except Exception as exc:
+                if verbose:
+                    print(f"Warning: teardown command {token!r} failed: {exc}")
+                # If L1 did not get through, h will not either, but try anyway:
+                # it costs one write against an already-broken link.
+                continue
+            await asyncio.sleep(0.2)
 
 
 # ===================================

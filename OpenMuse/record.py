@@ -1,5 +1,6 @@
 import asyncio
 import os
+import signal
 import time
 from typing import Iterable, List, Optional, Sequence, Union
 
@@ -10,6 +11,13 @@ from .decode import sensor_types_in
 from .muse import (describe_preset, HandshakeFailed, MuseS,
                    preset_for_sensors)
 from .utils import get_utc_timestamp
+
+
+# Seconds allowed for the vendor teardown (L1, h) on the way out. Short on
+# purpose: this is spent inside every dropout's reaction time, which is already
+# the dominant cost of a dropout (see the project's CLAUDE.md). Two writes on a
+# live link need a fraction of this; on a dead one no amount of waiting helps.
+_TEARDOWN_TIMEOUT = 3.0
 
 
 class RecordingStalled(RuntimeError):
@@ -143,6 +151,7 @@ async def _record_async(
         print(f"Connecting to {address} ...")
 
     stalled = False
+    cancelled = False
     start = time.monotonic()
 
     try:
@@ -153,30 +162,75 @@ async def _record_async(
             # Build callbacks dict for all data characteristics
             data_callbacks = {uuid: _callback(uuid) for uuid in subscribe_chars}
 
-            # Use shared connection routine
-            control = await MuseS.connect_and_initialize(
-                client,
-                preset,
-                data_callbacks,
-                verbose,
-                low_latency=low_latency,
-                on_control_raw=_on_control_raw,
-            )
+            # A signal must unwind through the teardown below rather than kill
+            # us where we stand. Python's default disposition for SIGTERM ends
+            # the process immediately, so the `finally` that halts the headset
+            # never ran on the path that matters most: a supervisor's
+            # file-growth watchdog `kill`ing this process on a dropout. The
+            # CancelledError arm below has always been written for this and
+            # never received one. Cancelling the task delivers it.
+            task = asyncio.current_task()
+            loop = asyncio.get_running_loop()
+            installed = []
+            stopping = False
 
-            # Streaming is now active (callbacks are registered and device is
-            # configured); data starts flowing asynchronously.
-            last_notification = time.monotonic()
+            def _request_stop():
+                # Once only. A second signal must not re-cancel a task that is
+                # already inside its teardown; a supervisor that loses patience
+                # has SIGKILL, which is the correct backstop.
+                nonlocal stopping
+                if stopping:
+                    return
+                stopping = True
+                if verbose:
+                    print("Signal received; halting the headset before exit ...")
+                task.cancel()
 
-            if verbose:
-                print(f"Recording for {duration} seconds to {outfile} ...")
+            for signame in ("SIGTERM", "SIGINT"):
+                sig = getattr(signal, signame, None)
+                if sig is None:
+                    continue
+                try:
+                    loop.add_signal_handler(sig, _request_stop)
+                except (NotImplementedError, RuntimeError, ValueError):
+                    # Windows has no add_signal_handler, and off the main thread
+                    # it is refused. Leave the default disposition rather than
+                    # fail the recording; the loss is a graceful exit, not data.
+                    pass
+                else:
+                    installed.append(sig)
 
-            start = time.monotonic()
-            next_battery = (
-                start + battery_interval
-                if battery_interval and battery_interval > 0
-                else None
-            )
+            # The handshake is inside the guarded region on purpose. It sends
+            # the preset and dc001, so from its first write onwards the headset
+            # may already be streaming -- and the two ways it goes wrong are
+            # exactly the ways that leave it configured with nobody attached: a
+            # supervisor's connect-timeout kill, and HandshakeFailed, which is
+            # raised *because* the headset came up in a configuration nobody
+            # asked for. Both now halt it on the way out.
             try:
+                control = await MuseS.connect_and_initialize(
+                    client,
+                    preset,
+                    data_callbacks,
+                    verbose,
+                    low_latency=low_latency,
+                    on_control_raw=_on_control_raw,
+                )
+
+                # Streaming is now active (callbacks are registered and device
+                # is configured); data starts flowing asynchronously.
+                last_notification = time.monotonic()
+
+                if verbose:
+                    print(f"Recording for {duration} seconds to {outfile} ...")
+
+                start = time.monotonic()
+                next_battery = (
+                    start + battery_interval
+                    if battery_interval and battery_interval > 0
+                    else None
+                )
+
                 while time.monotonic() - start < duration:
                     await asyncio.sleep(0.05)
                     now = time.monotonic()
@@ -226,10 +280,30 @@ async def _record_async(
                             if verbose:
                                 print(f"Warning: status query failed: {exc}")
             except asyncio.CancelledError:
-                pass
+                cancelled = True
             finally:
-                # Try to stop streaming gracefully
-                await MuseS.stop_streaming(client, verbose)
+                for sig in installed:
+                    try:
+                        loop.remove_signal_handler(sig)
+                    except Exception:
+                        pass
+                # Bounded: on a dead link a GATT write does not fail, it hangs
+                # until BlueZ gives up, and this sits inside a supervisor's own
+                # patience. Shielded because we may arrive here already
+                # cancelled, which would otherwise abort the teardown on its
+                # first await - the exact thing this change exists to prevent.
+                try:
+                    await asyncio.wait_for(
+                        asyncio.shield(MuseS.stop_streaming(client, verbose)),
+                        timeout=_TEARDOWN_TIMEOUT,
+                    )
+                except (asyncio.TimeoutError, asyncio.CancelledError):
+                    if verbose:
+                        print(
+                            f"Warning: teardown did not complete within "
+                            f"{_TEARDOWN_TIMEOUT:.0f}s; the link was probably "
+                            f"already gone"
+                        )
 
             # Unsubscribe
             for cuuid in subscribe_chars:
@@ -252,7 +326,8 @@ async def _record_async(
 
     elapsed = time.monotonic() - start
     if verbose:
-        print(f"Done. Wrote {notified} notifications ({bytes_written} bytes) to {outfile}.")
+        why = "Stopped by signal" if cancelled else "Done"
+        print(f"{why}. Wrote {notified} notifications ({bytes_written} bytes) to {outfile}.")
 
     if stalled:
         raise RecordingStalled(
