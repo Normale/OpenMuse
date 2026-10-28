@@ -186,7 +186,7 @@ class TestSigtermRunsTeardown(RecordTestCase):
 
     def test_sigterm_during_handshake_halts_before_exit(self):
         """Observed on the Pi: the signal can beat the preset out of the door."""
-        commands = self._sigterm_after("v6")
+        commands = self._sigterm_after("v7")
         self.assertEqual(commands[-2:], ["L1", "h"], f"got {commands!r}")
 
     def test_sigterm_returns_promptly(self):

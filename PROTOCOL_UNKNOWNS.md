@@ -164,14 +164,18 @@ starts in the right place, then characterise the remaining ~190 bytes.
 ## 7. Control-channel commands
 
 Known: `h` (halt), `dc001` (start streaming), `p<NNNN>` (preset), `s` (status),
-`v6`/`v7` (version), `L1`/`L0` (low latency on/off).
+`v7` (version; `v6` also answers), `L1`/`L0` (low latency on/off).
 
 Open questions:
 
-- **`v6` vs `v7`.** The vendor app sends `v7`; this package sends `v6`. The
-  status reply reports `pv:7` and `pv:4` respectively. Whether `pv` selects a
-  different packet encoding is **unknown and untested** — which is why `v7` is
-  available but not the default (`initialize_device(version_command=...)`).
+- **`v6` vs `v7` — settled 2026-10-28; this package now sends only `v7`.** The
+  version reply reports `pv:7` and `pv:4` respectively, and nothing else
+  differs. A whole 2.77 h vendor-app session (`v7`) decoded against a `v6` Pi
+  capture: packet TAG mix 44.4 / 25.2 / 26.2 / 3.5 / 0.7 % against 44.7 / 25.1 /
+  26.1 / 3.5 / 0.7 %, measured rates within 0.2 Hz, the same skipped-subpacket
+  rate, and identical field sets in the version and status replies. `pv` does
+  not select a different packet encoding on firmware 3.1.23 for `p1035`. What
+  `pv` *does* change, if anything, is still unknown.
 - **What `L1`/`L0` actually do.** Not the BLE connection interval: `btmon` shows
   the link pinned at **15 ms with no Connection Update after `L0`**, and the
   vendor app's own session sits at 15 ms too. So the documented rationale for

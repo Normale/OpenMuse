@@ -89,7 +89,7 @@ class FakeClient:
     async def write_gatt_char(self, uuid, data, response=False):
         token = bytes(data)[1:].decode("ascii").strip()
         self.commands.append(token)
-        if token == "v6":
+        if token == "v7":
             self._reply(VERSION_REPLY)
         elif token == "s":
             self._reply(STATUS_REPLY)
@@ -153,16 +153,13 @@ class TestLowLatencyIsOptIn(RecordTestCase):
             "L0", commands, "real-time streaming must keep low latency on"
         )
 
-    def test_version_command_default_is_v6(self):
+    def test_handshake_opens_with_v7_and_never_sends_v6(self):
+        """The vendor app's version query. v6 is retired: over a whole 2.77 h
+        v7 session the stream decoded identically to v6 (2026-10-28)."""
         self._record(stall_timeout=None, battery_interval=None)
         commands = FakeClient.instances[0].commands
-        self.assertIn("v6", commands)
-        self.assertNotIn(
-            "v7",
-            commands,
-            "v7 elicits pv:7 rather than pv:4 and is not yet validated against "
-            "this decoder, so it must not become the default silently",
-        )
+        self.assertEqual(commands[0], "v7", f"got {commands!r}")
+        self.assertNotIn("v6", commands)
 
 
 class TestStallDetection(RecordTestCase):

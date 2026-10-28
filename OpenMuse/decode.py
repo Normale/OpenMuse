@@ -188,7 +188,7 @@ ACCGYRO_CHANNELS = (
 #
 # CAVEAT: confirmed on firmware 3.1.23 (issue #24 reported 3.1.19). If the
 # order turns out to be firmware-dependent it must be keyed on the version
-# reported by "v6" rather than assumed globally.
+# reported by the version query ("v7") rather than assumed globally.
 OPTICS16_CHANNELS = (
     "OPTICS_LI_RED",
     "OPTICS_RI_RED",
@@ -263,7 +263,7 @@ def select_optics_channels(count: int) -> List[str]:
 # ===================================
 # Control-channel (status) replies
 # ===================================
-# The device answers control commands ("v6", "s", ...) on CONTROL_UUID with a
+# The device answers control commands ("v7", "s", ...) on CONTROL_UUID with a
 # JSON object.  Three properties of that channel, all verified on firmware
 # 3.1.23 / hw 01.1 / Athena_RevE, make naive parsing fail:
 #
@@ -274,7 +274,8 @@ def select_optics_channels(count: int) -> List[str]:
 #      -- so there is no clean '}{' to split on.  Splitting that way yields
 #      invalid JSON.  Objects must be found by brace matching.
 #   3. A "s" sent immediately after a fresh start_notify is frequently answered
-#      with silence.  Send "v6" first and keep one persistent subscription.
+#      with silence.  Send the version query ("v7") first and keep one
+#      persistent subscription.
 
 
 # Proprietary control characteristic. Recorders may interleave its
@@ -369,7 +370,7 @@ class ControlChannel:
     Feed raw notification payloads with :meth:`feed`; each call returns the
     JSON objects that completed within it.  The most recent value of every key
     ever seen is kept in :attr:`state`, so a single object exposes the merged
-    result of the ``v6`` (firmware/hardware) and ``s`` (battery/status) replies.
+    result of the ``v7`` (firmware/hardware) and ``s`` (battery/status) replies.
     """
 
     MAX_BUFFER = 8192

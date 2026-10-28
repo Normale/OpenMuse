@@ -211,7 +211,7 @@ The evidence is physiological. On an overnight capture (firmware 3.1.23, `Athena
 Optics8 and Optics4 are separate packet types (TAGs `0x35`, `0x34`), not slices of Optics16, and have their own layouts (`OPTICS8_CHANNELS`, `OPTICS4_CHANNELS`).
 
 > [!NOTE]
-> Confirmed on firmware 3.1.23 only (issue #24 reported 3.1.19). If the order turns out to be firmware-dependent it will have to be keyed on the version reported by `v6`.
+> Confirmed on firmware 3.1.23 only (issue #24 reported 3.1.19). If the order turns out to be firmware-dependent it will have to be keyed on the version reported by `v7`.
 
 ### Battery
 

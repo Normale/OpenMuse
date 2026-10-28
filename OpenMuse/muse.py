@@ -204,6 +204,15 @@ class MuseS:
         OTHER_UUID,
     )
 
+    # The version query that opens every handshake. ``v7`` is what the vendor
+    # app sends; this package used to send ``v6``. The two differ only in the
+    # reply's protocol-version field (``pv:7`` against ``pv:4``): measured over a
+    # whole 2.77 h vendor-app session (2026-10-28) against a ``v6`` Pi capture,
+    # the sensor stream decodes identically -- same packet TAG mix to 0.3%, same
+    # measured rates, same skipped-subpacket rate -- and the version and status
+    # replies carry the same fields. ``v6`` is no longer sent anywhere.
+    VERSION_COMMAND: ClassVar[str] = "v7"
+
     @staticmethod
     def encode_command(token: str) -> bytes:
         """Encode a Muse command token as length-prefixed ASCII."""
@@ -229,7 +238,6 @@ class MuseS:
         preset: str,
         verbose: bool = False,
         low_latency: bool = False,
-        version_command: str = "v6",
         low_latency_settle: float = 2.0,
         control: Optional["ControlChannel"] = None,
         status_timeout: float = 3.0,
@@ -256,7 +264,7 @@ class MuseS:
            from a previous session and never know.
 
         Performs:
-        1. Version query (``version_command``)
+        1. Version query (``v7``, see :attr:`VERSION_COMMAND`)
         2. Status query (s)
         3. Halt/reset (h)
         4. Apply preset
@@ -277,12 +285,6 @@ class MuseS:
             acquisition, only that it arrives.  With ``False`` (the default for
             ``record()``) the handshake still uses ``L1`` to get streaming
             started, then sends ``L0``, which is what the vendor app does.
-        version_command : str
-            ``v6`` (this package's historical choice) or ``v7`` (what the
-            vendor app sends).  They elicit different ``pv`` values in the
-            status reply -- ``pv:4`` and ``pv:7`` respectively -- so ``v7`` may
-            select a different protocol revision and has **not** been validated
-            against this package's decoder.  Left at ``v6`` until it has been.
         low_latency_settle : float
             Seconds to wait after ``dc001`` before sending ``L0``.  The vendor
             app waits ~4.8 s; the point is to let the stream establish under
@@ -290,7 +292,7 @@ class MuseS:
         """
         # Version/status handshake (best-effort)
         try:
-            await MuseS.send_command(client, version_command, verbose)
+            await MuseS.send_command(client, MuseS.VERSION_COMMAND, verbose)
             await asyncio.sleep(0.2)
             await MuseS.send_command(client, "s", verbose)
             await asyncio.sleep(0.2)
@@ -422,7 +424,7 @@ class MuseS:
           a recorder can persist the status replies alongside the sensor data.
 
         Returns the :class:`ControlChannel`, whose ``state`` holds the parsed
-        ``v6``/``s`` replies (firmware, hardware, serial, battery percent).
+        ``v7``/``s`` replies (firmware, hardware, serial, battery percent).
 
         This function:
         1. Subscribes to control notifications (for device info)
@@ -571,9 +573,9 @@ async def _get_status_async(
         await client.start_notify(
             MuseS.CONTROL_UUID, lambda _, data: control.feed(bytes(data))
         )
-        # "v6" first, then "s": a "s" sent immediately after a fresh
-        # start_notify is frequently answered with silence.
-        await MuseS.send_command(client, "v6")
+        # The version query first, then "s": a "s" sent immediately after a
+        # fresh start_notify is frequently answered with silence.
+        await MuseS.send_command(client, MuseS.VERSION_COMMAND)
         await asyncio.sleep(0.3)
         await MuseS.query_status(client, control)
         try:
@@ -588,7 +590,7 @@ async def _get_status_async(
 def get_status(address: str, timeout: float = 15.0, verbose: bool = False) -> Dict[str, Any]:
     """Connect to a Muse and read its self-reported status.
 
-    Returns the merged ``v6`` + ``s`` replies, e.g.::
+    Returns the merged ``v7`` + ``s`` replies, e.g.::
 
         {"fw": "3.1.23", "hw": "01.1", "sp": "Athena_RevE",
          "hn": "MuseS-1E2B", "sn": "7011-AH29-1E2B", "bp": 89.11, "ps": 4161}
