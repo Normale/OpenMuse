@@ -53,11 +53,14 @@ class LinkClient(FakeClient):
     plan = []
     attempts = 0
 
-    def __init__(self, address, timeout=None, disconnected_callback=None):
+    timeouts = []   # the timeout every connection attempt was given
+
+    def __init__(self, address, timeout=None, disconnected_callback=None, bluez=None):
         LinkClient.attempts += 1
+        LinkClient.timeouts.append(timeout)
         self.step = LinkClient.plan.pop(0) if LinkClient.plan else ("ok", None)
         self.disconnected_callback = disconnected_callback
-        super().__init__(address, timeout)
+        super().__init__(address, timeout, bluez=bluez)
 
     async def __aenter__(self):
         if self.step[0] == "absent":
@@ -89,6 +92,7 @@ class ReconnectTestCase(unittest.TestCase):
         FakeClient.emit_data = True
         LinkClient.plan = []
         LinkClient.attempts = 0
+        LinkClient.timeouts = []
         self.tmp = tempfile.mkdtemp()
         self.outfile = os.path.join(self.tmp, "rec.txt")
 
@@ -199,6 +203,43 @@ class TestRailsAreUnchanged(ReconnectTestCase):
             self._record([("silent", 10)], reconnect_window=None,
                          link_silence=0.2, stall_timeout=0.6, duration=30)
         self.assertEqual(len(FakeClient.instances), 1)
+
+
+class TestConnectAttemptsFitTheWindow(ReconnectTestCase):
+    """A blocking connect attempt must not outlive the reconnect window.
+
+    On 2026-10-29 a single attempt could hold its full 15 s while the window
+    was running out, so the window check never ran and the supervisor's 20 s
+    file-growth watchdog killed the recorder mid-reconnect, 7 times.
+    """
+
+    def test_first_connect_keeps_the_full_timeout(self):
+        self._record([("ok", None)], reconnect_window=5, duration=2.0)
+        self.assertEqual(LinkClient.timeouts[0], record_module._CONNECT_TIMEOUT)
+
+    def test_reconnect_attempts_are_capped_by_what_is_left(self):
+        plan = [("drop", 10)] + [("absent",)] * 200
+        with self.assertRaises(RecordingStalled):
+            self._record(plan, reconnect_window=3, duration=30)
+        retries = LinkClient.timeouts[1:]
+        self.assertTrue(retries, "expected reconnect attempts")
+        for t in retries:
+            self.assertLessEqual(t, 3.0)
+            self.assertGreaterEqual(t, record_module._MIN_CONNECT_TIMEOUT)
+
+
+class TestAdapterSelection(ReconnectTestCase):
+    def test_adapter_is_passed_to_bleak(self):
+        self._record([("drop", 10), ("ok", None)], reconnect_window=5,
+                     duration=4.0, adapter="hci1")
+        self.assertEqual(len(FakeClient.instances), 2)
+        for client in FakeClient.instances:
+            self.assertEqual(client.bluez, {"adapter": "hci1"},
+                             "every connection, reconnects included, must use it")
+
+    def test_no_adapter_leaves_bleak_to_choose(self):
+        self._record([("ok", None)], reconnect_window=5, duration=2.0)
+        self.assertEqual(FakeClient.instances[0].bluez, {})
 
 
 class TestWatchdogIsRearmed(ReconnectTestCase):

@@ -51,8 +51,10 @@ class FakeClient:
     emit_data = True
     instances = []
 
-    def __init__(self, address, timeout=None, disconnected_callback=None):
+    def __init__(self, address, timeout=None, disconnected_callback=None, bluez=None):
         self.address = address
+        self.timeout = timeout
+        self.bluez = bluez or {}
         self.name = "FakeMuse"
         self.commands = []
         self._notify = {}

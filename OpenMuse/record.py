@@ -32,6 +32,12 @@ _LINK_SILENCE = 8.0
 # L1, h to land if it is not.
 _SILENT_TEARDOWN = 1.0
 
+# Connection attempt timeout (bleak's find-device scan plus the connect). On a
+# reconnect it is cut to what is left of the reconnect window, but never below
+# the minimum: a Muse that is advertising is found and connected in ~0.3-2 s.
+_CONNECT_TIMEOUT = 15.0
+_MIN_CONNECT_TIMEOUT = 2.0
+
 # Pause between failed reconnect attempts. The vendor app reconnects 0.16 s
 # after the disconnect event; the headset advertises again immediately.
 _RECONNECT_RETRY = 0.5
@@ -96,6 +102,7 @@ async def _record_async(
     battery_interval: Optional[float] = 300.0,
     reconnect_window: Optional[float] = None,
     link_silence: Optional[float] = _LINK_SILENCE,
+    adapter: Optional[str] = None,
 ) -> RecordingResult:
     if subscribe_chars is None:
         subscribe_chars = list(MuseS.DATA_CHARACTERISTICS)
@@ -372,10 +379,26 @@ async def _record_async(
             def _on_disconnect(_client, _flag=link_down):
                 _flag.set()
 
+            # One connection attempt can block for its whole timeout (bleak's
+            # find-device scan plus the connect). Mid-outage that must fit in
+            # what is left of the reconnect window, or the window check below
+            # never gets to run and a supervisor's own watchdog kills us
+            # mid-attempt instead -- 7 times on 2026-10-29, each costing a
+            # process restart on top of the outage.
+            connect_timeout = _CONNECT_TIMEOUT
+            if reconnecting and lost_at is not None:
+                left = reconnect_window - (time.monotonic() - last_notification)
+                if left <= 0:
+                    lost_for_good = True
+                    break
+                connect_timeout = max(_MIN_CONNECT_TIMEOUT, min(_CONNECT_TIMEOUT, left))
+            client_kwargs = dict(
+                timeout=connect_timeout, disconnected_callback=_on_disconnect
+            )
+            if adapter:
+                client_kwargs["bluez"] = {"adapter": adapter}
             try:
-                client_cm = bleak.BleakClient(
-                    address, timeout=15.0, disconnected_callback=_on_disconnect
-                )
+                client_cm = bleak.BleakClient(address, **client_kwargs)
                 async with client_cm as client:
                     sessions += 1
                     if lost_at is not None:
@@ -507,6 +530,7 @@ def record(
     battery_interval: Optional[float] = 300.0,
     reconnect_window: Optional[float] = None,
     link_silence: Optional[float] = _LINK_SILENCE,
+    adapter: Optional[str] = None,
 ) -> List[RecordingResult]:
     """
     Connect to one or more Muse devices, stream notifications, and append raw packets to text file(s).
@@ -556,6 +580,10 @@ def record(
     - link_silence: With ``reconnect_window`` set, a connection that BlueZ
       still reports as up but that has delivered no sensor data for this many
       seconds is dropped and reconnected. Default 8 s.
+    - adapter: BlueZ adapter to connect through, e.g. ``"hci1"`` (Linux only;
+      ignored elsewhere). ``None`` (default) uses BlueZ's default adapter,
+      which is whichever one bleak resolves first -- not a stable choice once
+      a second adapter is plugged in. Name it whenever more than one exists.
 
     Returns a list of :class:`RecordingResult`, one per device, reporting the
     notification and byte counts so a caller can detect a zero-yield run.
@@ -622,6 +650,7 @@ def record(
                     battery_interval=battery_interval,
                     reconnect_window=reconnect_window,
                     link_silence=link_silence,
+                    adapter=adapter,
                 )
             )
 
