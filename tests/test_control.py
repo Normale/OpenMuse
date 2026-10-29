@@ -284,3 +284,54 @@ class TestStatusBatteryInDecode(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestReplyCutByADropout(unittest.TestCase):
+    """A reply cut off by a dropout must not swallow the replies after it.
+
+    Observed 2026-10-29: with in-process reconnects one capture holds many
+    connections, so a status reply truncated by a link drop is followed by
+    complete replies from the next connection. The truncated "{..." left an
+    unclosed brace; every later reply nested inside it and none was emitted
+    until buffer trimming resynchronised the scan, when 54 readings spanning
+    minutes came out at once, stamped with one line's time. The night then
+    failed analysis as non-monotonic.
+    """
+
+    def _cut_then_whole(self, n_after=5):
+        cut = fragments(json.dumps(STATUS_REPLY, separators=(",", ":")).encode())[:2]
+        whole = []
+        for i in range(n_after):
+            r = dict(STATUS_REPLY)
+            r["bp"] = 80.0 - i
+            whole.append(r)
+        return cut, whole
+
+    def test_every_later_reply_is_emitted_when_it_completes(self):
+        cut, whole = self._cut_then_whole()
+        control = ControlChannel()
+        for frag in cut:
+            self.assertEqual(control.feed(frag), [])
+        for r in whole:
+            got = []
+            for frag in json_fragments(r):
+                got += control.feed(frag)
+            self.assertEqual([g["bp"] for g in got], [r["bp"]],
+                             "each reply must complete on its own fragments")
+
+    def test_readings_keep_their_own_timestamps(self):
+        from datetime import datetime, timedelta
+
+        cut, whole = self._cut_then_whole()
+        t0 = datetime.fromisoformat("2026-10-29T03:00:00+00:00")
+        frags = list(cut) + [f for r in whole for f in json_fragments(r)]
+        # 60 s between notifications: replies minutes apart, as overnight
+        messages = [
+            f"{(t0 + timedelta(seconds=60 * i)).isoformat()}\t{CONTROL_UUID}\t{f.hex()}"
+            for i, f in enumerate(frags)
+        ]
+        battery = decode_rawdata(messages, timebase="absolute")["BATTERY"]
+        status = battery[battery["source"] == "status"]
+        self.assertEqual(len(status), len(whole))
+        t = status["time"].to_numpy()
+        self.assertTrue((t[1:] > t[:-1]).all(), f"timestamps must strictly increase: {t}")

@@ -390,6 +390,18 @@ class ControlChannel:
 
     def feed_text(self, text: str) -> List[Dict[str, Any]]:
         """Same as :meth:`feed` for already-decoded text."""
+        # A reply always starts a fresh notification with "{", and replies are
+        # flat (no nested objects), so a fragment that opens with "{" while a
+        # partial reply is still pending means that partial was abandoned: the
+        # link dropped mid-reply. Keeping it would nest every later reply inside
+        # the unclosed brace and emit none of them until MAX_BUFFER trimming
+        # resynchronised the scan - then dozens at once, all stamped with that
+        # one line's time. Observed 2026-10-29, once in-process reconnects put
+        # many connections into one capture: 54 battery readings spanning
+        # minutes shared a single timestamp, and the night failed analysis as
+        # non-monotonic.
+        if self._buffer and text.lstrip().startswith("{"):
+            self._buffer = ""
         self._buffer += text
         raw_objects, consumed = _scan_json_objects(self._buffer)
         self._buffer = self._buffer[consumed:]
